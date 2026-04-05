@@ -4,7 +4,11 @@
 #include <NTPClient.h>
 #include <ArduinoOTA.h>
 #include <EEPROM.h>
+#include <IRrecv.h>
+#include <IRremoteESP8266.h>
 //user libraries
+#include "SubwooferControls.h"
+#include "IRInstructionHandler.h"
 #include "keys.h"
 /*Defines key values in the following format:
 #ifndef KEYS_H
@@ -16,14 +20,19 @@
 
 #endif
 */
+/*options*/
+#define _IR_ENABLE_DEFAULT_ false
+#define DECODE_JVC true
 
-const char* ssid = STASSID;
-const char* password = STAPSK;
-
+/*global objects*/
 WiFiServer espServer(80); /* Instance of WiFiServer with port number 80 */
 /* 80 is the Port Number for HTTP Web Server */
 WiFiUDP ntpUdp;
 NTPClient timeClient(ntpUdp, "pool.ntp.org");
+
+/*irrecv declaration*/
+IRrecv irrecv(D5);
+decode_results results;
 
 struct headersHttp{
   int contentLength = 0;
@@ -43,9 +52,16 @@ unsigned long timerEndAtLastUpdate = 0;
 unsigned long scheduleOffTimeAtLastUpdate = 0;
 unsigned long scheduleOnTimeAtLastUpdate = 0;
 
+//IR sleep button handler
+unsigned long timeSleepButton = 0;
+unsigned int numSleepButtonPresses = 0;
+
+const char* ssid = STASSID;
+const char* password = STAPSK;
+
 /*Important values that change depending on server capabilities*/
 /*API Web Server Handlers, could be its own library*/
-const int numPaths = 3;
+const size_t numPaths = 3;
 const char validPaths[numPaths][16] = {"/", "/power", "/power/timer"};
 /*To add, "/power/schedule"*/
 
@@ -94,64 +110,12 @@ bool pathExists(const String& pathHttp){
   return false;
 }
 
-/*Time System Handlers*/
-void setSleepTimer(long seconds){
-  if (seconds == 0) timerEnd = 0;
-  else timerEnd = timeClient.getEpochTime() + (unsigned long)seconds;
-  //we know that timer for sure is changed.
-  saveTimesToEEPROM();
-}
-
-//remoteIR will have a different handler/system based off incremental presses where if not pressed within a certain amount of time will not update.
-//first press ignored, then subsequent within 5 seconds are counted. Can be updated and added to current timer in same fashion. Only update eeprom when time expires.
-void saveTimesToEEPROM(){
-  bool update = false;
-  if (timerEnd != timerEndAtLastUpdate){
-    EEPROM.put(0, timerEnd);
-    timerEndAtLastUpdate = timerEnd;
-    update = true;
-  }
-  if (scheduleOffTime != scheduleOffTimeAtLastUpdate){
-    EEPROM.put(4, scheduleOffTime);
-    scheduleOffTimeAtLastUpdate = scheduleOffTime;
-    update = true;
-  }
-  if (scheduleOnTime != scheduleOnTimeAtLastUpdate){
-    EEPROM.put(8, scheduleOnTime);
-    scheduleOnTimeAtLastUpdate = scheduleOnTime;
-    update = true;
-  }
-
-  if(update)
-    EEPROM.commit();
-}
-
-/*Internal system controls*/
-
-void turnAmpOn(){
-  digitalWrite(5, HIGH);
-  powerOn = true;
-  //if a timer is set
-  if (timerEnd != 0){
-    timerEnd = 0;
-    saveTimesToEEPROM();
-  }
-}
-
-void turnAmpOff(){
-  digitalWrite(5, LOW);
-  powerOn = false;
-  //if a timer is set
-  if (timerEnd != 0){
-    timerEnd = 0;
-    saveTimesToEEPROM();
-  }
-}
-
 void setup() {
-  pinMode(5, OUTPUT);
-  pinMode(0, INPUT);
-  digitalWrite(5, LOW); 
+  pinMode(D1, OUTPUT);
+  pinMode(D2, OUTPUT);
+  pinMode(D5, INPUT);
+  digitalWrite(D1, LOW); 
+  digitalWrite(D2, LOW);
   EEPROM.begin(512);
   //
   EEPROM.get(0, timerEnd);
@@ -161,6 +125,7 @@ void setup() {
   scheduleOffTimeAtLastUpdate = scheduleOffTime;
   scheduleOnTimeAtLastUpdate = scheduleOnTime;
   Serial.begin(115200);
+  irrecv.enableIRIn();
   delay(5000);
   Serial.println("Booting");
   WiFi.mode(WIFI_STA);
@@ -241,14 +206,46 @@ void loop() {
   unsigned long now = timeClient.getEpochTime();
   if (timerEnd != 0 && now >= timerEnd)
     turnAmpOff();
+  //IR is good for now, but COMPU-LINK compatibility is the gold standard
+  //Will allow the device to move in lock-step with the receiver, which is the ultimate goal.
   /*same for any schedule evaluations*/
-  /*handle any API calls*/
+  /*first, decode any ir inputs*/
+  if (irrecv.decode(&results)) {
+    handleCode(results.command);
+    irrecv.resume();
+  }
+
+  //compare time to last button press time, if 5 seconds have elapsed set time to time recieved.
+  if ((now - timeSleepButton) > 5 && timeSleepButton != 0){
+    unsigned long timeUntilEnd = 0;
+    timeSleepButton = 0;
+    if (numSleepButtonPresses == 1){ //only to display time on receiver, so just put back current time.
+      //i.e. do nothing
+    }
+    else if (timerEnd == 0){ //timer initialization step
+      unsigned int totalSteps = numSleepButtonPresses-1;
+      setSleepTimer((totalSteps)*600);
+    }
+    else{ //timer is initialized, so work from there
+      timeUntilEnd = timerEnd - now;
+      unsigned int remainingSteps = (timeUntilEnd + 599) / 600;
+      //second press consumed to inputing "round-up" time.
+      unsigned int totalSteps = numSleepButtonPresses-2 + remainingSteps;
+      setSleepTimer((totalSteps)*600);
+    }
+    //if 1 do nothing (good)
+    //if 2 round up to nearest 10
+    //beyond handle normally (adding 10 each time)
+    numSleepButtonPresses = 0;
+  }
+
+  /*handle any API calls (to do: make this a class or seperate function structure)*/
   WiFiClient client = espServer.available(); /* Check if a client is available */
   if(!client)
   {
     return;
   }
-  
+  /*Develop into a handler class to create better multitasking (each step one at a time)*/
   Serial.println("New Client!!!");
   /*Example requests:
    * GET:
@@ -303,14 +300,17 @@ void loop() {
   long contentLong = 0;
   String contentString = "";
   /* Extract the URL of the request */
-  /* We have two URLs. If IP Address is 192.168.1.6 (for example),
+  /* We have three URLs. If IP Address is 192.168.1.6 (for example),
    * then URLs are: 
    * 192.168.1.6/ and its requests are: 
    *        GET / HTTP/1.1, where it will populate the client an HTML UI interface
-   * 192.168.1.6/LED and its requests are: 
-   *        GET /LED HTTP/1.1 , where it will post to the server the status of the light (on or off)
-   *        POST /LED HTTP/1.1 , where it will update the light to the status in the content of the request(on or off)
-   */
+   * 192.168.1.6/power and its requests are: 
+   *        GET /power HTTP/1.1 , where it will respond to the client with the status of the light (on or off)
+   *        POST /power HTTP/1.1 , where it will update the light to the status in the content of the request(on or off)
+   * 192.168.1.6/power/timer and its requests are: 
+   *        GET /power/timer HTTP/1.1 , where it will respond to the client with the time remaining, if there is a timer active
+   *        POST /power/timer HTTP/1.1 , where it will update "timerEnd" = now + sleep={{timeTilOff}} (the content of the request)
+   */ 
   
   if(!pathExists(pathHttp)){
     client.println("HTTP/1.1 404 Not Found");
@@ -351,21 +351,22 @@ void loop() {
       client.println("HTTP/1.1 200 OK");
       client.println("Content-Type: text/html");
       client.println("Connection: close");
-      client.println();
+      client.println();//to add: status dashboard.
       client.println(R"rawliteral(
-      <!DOCTYPE html>
+            <!DOCTYPE html>
       <html>
       <head>
       <title>Subwoofer WebUI</title>
       <meta name="viewport" content="width=device-width, initial-scale=1.0">
-      <meta http-equiv="refresh" content="30">
       <style>
       body {background-color: #121212; font-family: Tahoma, sans-serif; margin-top: 40px;}
       h1, h2   {color: #E0E0E0; text-align: center}
-      h3, h4   {color: #E0E0E0; text-align: left; margin-left: 20px}
-      p    {color: #B0B0B0; margin-left: 10px}
-      button {font-size: 20px; padding: 10px 20px; margin: 10px;}
-      .timer-label {color: #B0B0B0; margin-left: 10px}
+      h3   {font-size: 20px; font-weight: 600; color: #E6E6E6; margin: 30px 0 12px 20px;}
+      h4   {font-size: 14px;font-weight: 500;color: #B8B8B8;margin: 16px 0 6px 20px;text-transform: uppercase;letter-spacing: 0.5px;}
+      p    {color: #B0B0B0; margin-left: 20px}
+      button {font-size: 15px; padding: 10px 10px; margin: 20px;}
+      .timer-label {color: #FFFFC5; font-size: 40px; margin: 20px 20px; line-height: 1.2;}
+      .timer-input {color: #B0B0B0; margin-left: 20px}
       #status {margin-top: 20px; font-weight: bold;}
       </style>
       </head>
@@ -374,7 +375,7 @@ void loop() {
       <h1>
       Subwoofer Web Interface
       </h1>
-      <p>See below the available API interactions for the Subwoofer's Microcontroller.</p>
+      <p>See below the status and the available API interactions for the Subwoofer's Microcontroller.</p>
 
       <h2>API Call Interfaces</h2>
       <br>
@@ -382,8 +383,8 @@ void loop() {
       <h4>Power On/Off</h4>
       <button id="powerBtn" onclick = togglePower()>loading...</button>
       <h4>Power Sleep Timer</h4>
-      <p style="color:#FFFFC5;font-size:40px;">Power off in <span id ="timerDisplay">--:--</span> seconds</p> <br>
-      <label for="timerInput" class="timer-label">Set timer (minutes):</label>
+      <p class="timer-label">Power off in <span id ="timerDisplay">--:--</span></p>
+      <label for="timerInput" class="timer-input">Set timer (minutes):</label>
       <input type="number" id="timerInput" min="0">
       <button onclick="startTimerFromInput()">Start Timer</button>
  
@@ -396,6 +397,7 @@ void loop() {
       <script>
       let powerStatus = false;
       let remainingSeconds = 0;
+      let timerEnd = 0;
 
       function updateButton() {
         const button = document.getElementById("powerBtn")
@@ -437,6 +439,7 @@ void loop() {
         .then(response => response.text())
         .then(text => {
           timerEnd = Math.floor(Date.now() / 1000) + seconds;
+          remainingSeconds = seconds;
           updateTimerDisplay(remainingSeconds);
         })
         .catch(err => console.error(err));
@@ -458,6 +461,7 @@ void loop() {
             const seconds = parseInt(parts[1]);
             const now = Math.floor(Date.now() / 1000);
             timerEnd = now + seconds;
+            remainingSeconds = seconds;
             updateTimerDisplay(remainingSeconds);
           }
         });
@@ -473,12 +477,11 @@ void loop() {
 
         getTimer();
       }
-      const intervalUpdateTimer = setInterval(() => {
+      setInterval(() => {
         if (remainingSeconds > 0) {
           remainingSeconds--;
           updateTimerDisplay(remainingSeconds);
-        } else {
-          clearInterval(intervalUpdateTimer);
+        } else if (remainingSeconds === 0) {
           document.getElementById("timerDisplay").innerText = "--:--";
         }
       }, 1000);
@@ -488,7 +491,7 @@ void loop() {
       window.onload = fetchInitialState;
       </script>
       
-      </html> 
+      </html>  
       )rawliteral");
 
       client.stop();
@@ -517,10 +520,10 @@ void loop() {
         return;
       }
       else if(methodHttp == "POST"){
-        if(body.startsWith("sleep=")){ //if body has power= as preceeding term, i.e. valid content.
+        if(body.startsWith("sleep=")){ //if body has sleep= as preceeding term, i.e. valid content.
           splitIndex = body.indexOf('=');
           contentLong = body.substring(splitIndex + 1).toInt();
-          if (contentLong >= 0){
+          if (contentLong >= 0 && digitalRead(D1) == HIGH){ //only allow to set the power if its on.
             setSleepTimer(contentLong);          
             client.println("HTTP/1.1 200 OK");
             client.println("Content-Type: text/plain");
@@ -529,15 +532,17 @@ void loop() {
             client.print("sleep=");
             client.println(contentLong);
             Serial.println("Responded with 200");
+            client.stop();
+            return;
           }
-          else{
-            client.println("HTTP/1.1 400 Bad Request");
-            client.println("Content-Type: text/plain");
-            client.println("Connection: close");
-            client.println();
-            client.println("Invalid Body Format");
-            Serial.println("Responded with 400");
-          }
+        }
+        else{
+          client.println("HTTP/1.1 400 Bad Request");
+          client.println("Content-Type: text/plain");
+          client.println("Connection: close");
+          client.println();
+          client.println("Invalid Body Format");
+          Serial.println("Responded with 400");
           client.stop();
           return;
         }
